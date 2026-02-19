@@ -19,6 +19,12 @@ type Predicate func(ctx context.Context, update telego.Update) bool
 // ErrorHandler handles error that came from bot handing update
 type ErrorHandler func(ctx *Context, update telego.Update, err error)
 
+// MultiBotHandlerUpdate represents update with the bot pointer, used in multiple bot handler
+type MultiBotHandlerUpdate struct {
+	telego.Update
+	Bot *telego.Bot
+}
+
 // BotHandler represents a bot handler that can handle updated matching by predicates
 type BotHandler struct {
 	bot          *telego.Bot
@@ -30,6 +36,8 @@ type BotHandler struct {
 	lock     sync.RWMutex
 	stop     chan struct{}
 	handlers sync.WaitGroup
+
+	botsUpdates <-chan MultiBotHandlerUpdate
 }
 
 // BotHandlerOption represents an option that can be applied to bot handler
@@ -42,6 +50,24 @@ func NewBotHandler(bot *telego.Bot, updates <-chan telego.Update, options ...Bot
 		bot:       bot,
 		updates:   updates,
 		baseGroup: &HandlerGroup{},
+	}
+
+	for _, option := range options {
+		if err := option(bh); err != nil {
+			return nil, fmt.Errorf("telego: bot handler options: %w", err)
+		}
+	}
+
+	return bh, nil
+}
+
+// NewMultipleBotHandler creates new bot handler that can handle updates from multiple bots, updates must be sent to the
+// update channel with the bot pointer, otherwise [BotHandler.Start] will return an error when receiving such update
+// Note: Currently no options available, they may be added in future
+func NewMultipleBotHandler(updates <-chan MultiBotHandlerUpdate, options ...BotHandlerOption) (*BotHandler, error) {
+	bh := &BotHandler{
+		baseGroup:   &HandlerGroup{},
+		botsUpdates: updates,
 	}
 
 	for _, option := range options {
@@ -75,6 +101,41 @@ func (h *BotHandler) Start() error {
 
 	depth := h.baseGroup.depth(1)
 
+	handleUpdate := func(update telego.Update, bot *telego.Bot) {
+		h.handlers.Go(func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			go func() {
+				select {
+				case <-ctx.Done():
+					// Done processing
+				case <-h.stop:
+					cancel()
+				}
+			}()
+
+			bCtx := &Context{
+				ctx: ctx,
+				ctxBase: &ctxBase{
+					bot:        bot,
+					updateID:   update.UpdateID,
+					group:      h.baseGroup,
+					finalGroup: nil, // Not set
+					stack:      append(make([]int, 0, depth), -1),
+				},
+			}
+
+			if err := bCtx.Next(update); err != nil {
+				if h.errorHandler != nil {
+					h.errorHandler(bCtx, update, err)
+				} else {
+					bot.Logger().Errorf("Error processing update %d, err: %s", update.UpdateID, err)
+				}
+			}
+		})
+	}
+
 	for {
 		select {
 		case <-h.stop:
@@ -82,44 +143,24 @@ func (h *BotHandler) Start() error {
 				return fmt.Errorf("telego: bot handler stopped, %d update(s) left unhandled", unhandled)
 			}
 			return nil
-		case update, ok := <-h.updates:
+		case update, ok := <-h.botsUpdates:
 			if !ok {
 				return nil
 			}
 
-			// Process update
-			h.handlers.Go(func() {
-				ctx, cancel := context.WithCancel(context.Background())
-				defer cancel()
+			if update.Bot == nil {
+				return errors.New("telego: bot handler received update without bot")
+			}
+			handleUpdate(update.Update, update.Bot)
 
-				go func() {
-					select {
-					case <-ctx.Done():
-						// Done processing
-					case <-h.stop:
-						cancel()
-					}
-				}()
-
-				bCtx := &Context{
-					ctx: ctx,
-					ctxBase: &ctxBase{
-						bot:        h.bot,
-						updateID:   update.UpdateID,
-						group:      h.baseGroup,
-						finalGroup: nil, // Not set
-						stack:      append(make([]int, 0, depth), -1),
-					},
-				}
-
-				if err := bCtx.Next(update); err != nil {
-					if h.errorHandler != nil {
-						h.errorHandler(bCtx, update, err)
-					} else {
-						h.bot.Logger().Errorf("Error processing update %d, err: %s", update.UpdateID, err)
-					}
-				}
-			})
+		case update, ok := <-h.updates:
+			if !ok {
+				return nil
+			}
+			if h.bot == nil {
+				return errors.New("telego: bot handler has no bot")
+			}
+			handleUpdate(update, h.bot)
 		}
 	}
 }
