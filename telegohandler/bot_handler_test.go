@@ -24,22 +24,30 @@ const (
 
 var errTest = errors.New("error")
 
+func newTestBot(t *testing.T, testToken string) *telego.Bot {
+	t.Helper()
+
+	bot, err := telego.NewBot(testToken)
+	require.NoError(t, err)
+
+	return bot
+}
+
 func newTestBotHandler(t *testing.T) *BotHandler {
 	t.Helper()
 
-	bot, err := telego.NewBot(token)
-	require.NoError(t, err)
-
+	bot := newTestBot(t, token)
 	updates := make(chan telego.Update)
 
+	var err error
 	bh, err := NewBotHandler(bot, updates)
 	require.NoError(t, err)
 	return bh
 }
 
 func TestNewBotHandler(t *testing.T) {
-	bot, err := telego.NewBot(token)
-	require.NoError(t, err)
+	bot := newTestBot(t, token)
+	var err error
 
 	updates := make(chan telego.Update)
 
@@ -71,6 +79,146 @@ func TestNewBotHandler(t *testing.T) {
 		require.ErrorIs(t, err, errTest)
 		assert.Nil(t, bh)
 	})
+}
+
+func TestNewMultiBotHandler(t *testing.T) {
+	updates := make(chan UpdateWithBot)
+
+	var bh *BotHandler
+	var err error
+
+	t.Run("success", func(t *testing.T) {
+		bh, err = NewMultiBotHandler(updates)
+		require.NoError(t, err)
+
+		assert.Equal(t, &HandlerGroup{}, bh.baseGroup)
+		assert.EqualValues(t, updates, bh.updatesWithBot)
+		assert.Nil(t, bh.stop)
+	})
+
+	t.Run("success_with_options", func(t *testing.T) {
+		bh, err = NewMultiBotHandler(updates, func(_ *BotHandler) error { return nil })
+		require.NoError(t, err)
+
+		assert.Equal(t, &HandlerGroup{}, bh.baseGroup)
+		assert.EqualValues(t, updates, bh.updatesWithBot)
+		assert.Nil(t, bh.stop)
+	})
+
+	t.Run("error_with_options", func(t *testing.T) {
+		bh, err = NewMultiBotHandler(updates, func(_ *BotHandler) error { return errTest })
+
+		require.ErrorIs(t, err, errTest)
+		assert.Nil(t, bh)
+	})
+}
+
+func TestBotHandler_Start_MultiBot(t *testing.T) {
+	botOne := newTestBot(t, token)
+	botTwo := newTestBot(t, "1234567891:aaaabbbbaaaabbbbaaaabbbbaaaabbbbccc")
+
+	updatesWithBot := make(chan UpdateWithBot, 2)
+	bh, err := NewMultiBotHandler(updatesWithBot)
+	require.NoError(t, err)
+
+	type handledUpdate struct {
+		updateID int
+		bot      *telego.Bot
+	}
+
+	wg := sync.WaitGroup{}
+	handled := make(chan handledUpdate, 2)
+
+	bh.Handle(func(ctx *Context, update telego.Update) error {
+		defer wg.Done()
+		handled <- handledUpdate{
+			updateID: update.UpdateID,
+			bot:      ctx.Bot(),
+		}
+		return nil
+	})
+
+	timeoutSignal := time.After(timeout)
+	done := make(chan struct{})
+
+	assert.NotPanics(t, func() {
+		wg.Add(2)
+
+		go func() {
+			errStart := bh.Start()
+			assert.NoError(t, errStart)
+		}()
+
+		for !bh.IsRunning() {
+			// Wait for handler to start
+		}
+
+		updatesWithBot <- UpdateWithBot{
+			Update: telego.Update{UpdateID: 1},
+			Bot:    botOne,
+		}
+		updatesWithBot <- UpdateWithBot{
+			Update: telego.Update{UpdateID: 2},
+			Bot:    botTwo,
+		}
+
+		go func() {
+			wg.Wait()
+			done <- struct{}{}
+		}()
+
+		select {
+		case <-timeoutSignal:
+			t.Fatal("Timeout")
+		case <-done:
+		}
+
+		err = bh.Stop()
+		require.NoError(t, err)
+	})
+
+	close(handled)
+
+	received := map[int]*telego.Bot{}
+	for item := range handled {
+		received[item.updateID] = item.bot
+	}
+
+	require.Len(t, received, 2)
+	assert.Equal(t, botOne, received[1])
+	assert.Equal(t, botTwo, received[2])
+}
+
+func TestBotHandler_Start_MultiBot_WithoutBot(t *testing.T) {
+	updatesWithBot := make(chan UpdateWithBot, 1)
+
+	bh, err := NewMultiBotHandler(updatesWithBot)
+	require.NoError(t, err)
+
+	startErr := make(chan error, 1)
+
+	go func() {
+		startErr <- bh.Start()
+	}()
+
+	for !bh.IsRunning() {
+		// Wait for handler to start
+	}
+
+	updatesWithBot <- UpdateWithBot{
+		Update: telego.Update{UpdateID: 1},
+		Bot:    nil,
+	}
+
+	select {
+	case err = <-startErr:
+		require.EqualError(t, err, "telego: bot handler received update without bot")
+	case <-time.After(timeout):
+		t.Fatal("Timeout")
+	}
+
+	err = bh.Stop()
+	require.NoError(t, err)
 }
 
 func TestBotHandler_Start(t *testing.T) {
