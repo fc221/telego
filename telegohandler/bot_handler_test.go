@@ -73,6 +73,109 @@ func TestNewBotHandler(t *testing.T) {
 	})
 }
 
+func TestNewBotUpdateHandler(t *testing.T) {
+	updates := make(chan BotUpdate)
+
+	var bh *BotHandler
+	var err error
+
+	t.Run("success", func(t *testing.T) {
+		bh, err = NewBotUpdateHandler(updates)
+		require.NoError(t, err)
+
+		assert.Nil(t, bh.bot)
+		assert.EqualValues(t, updates, bh.botUpdates)
+		assert.Equal(t, &HandlerGroup{}, bh.baseGroup)
+		assert.Nil(t, bh.stop)
+	})
+
+	t.Run("success_with_options", func(t *testing.T) {
+		bh, err = NewBotUpdateHandler(updates, func(_ *BotHandler) error { return nil })
+		require.NoError(t, err)
+
+		assert.Nil(t, bh.bot)
+		assert.EqualValues(t, updates, bh.botUpdates)
+		assert.Equal(t, &HandlerGroup{}, bh.baseGroup)
+		assert.Nil(t, bh.stop)
+	})
+
+	t.Run("error_with_options", func(t *testing.T) {
+		bh, err = NewBotUpdateHandler(updates, func(_ *BotHandler) error { return errTest })
+
+		require.ErrorIs(t, err, errTest)
+		assert.Nil(t, bh)
+	})
+}
+
+func TestBotHandler_Start_BotUpdate(t *testing.T) {
+	t.Run("with_updates", func(t *testing.T) {
+		bot1, err := telego.NewBot(token)
+		require.NoError(t, err)
+
+		bot2, err := telego.NewBot(token)
+		require.NoError(t, err)
+
+		updates := make(chan BotUpdate)
+
+		bh, err := NewBotUpdateHandler(updates)
+		require.NoError(t, err)
+
+		wg := sync.WaitGroup{}
+		byUpdateID := map[int]*telego.Bot{
+			1: bot1,
+			2: bot2,
+		}
+
+		bh.Handle(func(ctx *Context, update telego.Update) error {
+			defer wg.Done()
+			assert.Equal(t, byUpdateID[update.UpdateID], ctx.Bot())
+			return nil
+		})
+
+		timeoutSignal := time.After(timeout * 10)
+		done := make(chan struct{})
+
+		wg.Add(2)
+
+		go func() {
+			errStart := bh.Start()
+			assert.NoError(t, errStart)
+		}()
+
+		for !bh.IsRunning() {
+			// Wait for handler to start
+		}
+
+		updates <- BotUpdate{Update: telego.Update{UpdateID: 1}, Bot: bot1}
+		updates <- BotUpdate{Update: telego.Update{UpdateID: 2}, Bot: bot2}
+
+		go func() {
+			wg.Wait()
+			done <- struct{}{}
+		}()
+
+		select {
+		case <-timeoutSignal:
+			t.Fatal("Timeout")
+		case <-done:
+		}
+
+		err = bh.Stop()
+		require.NoError(t, err)
+	})
+
+	t.Run("without_bot_error", func(t *testing.T) {
+		updates := make(chan BotUpdate, 1)
+		updates <- BotUpdate{Update: telego.Update{UpdateID: 1}}
+
+		bh, err := NewBotUpdateHandler(updates)
+		require.NoError(t, err)
+
+		err = bh.Start()
+		require.EqualError(t, err, "telego: bot handler received update without bot")
+	})
+}
+
 func TestBotHandler_Start(t *testing.T) {
 	bot, err := telego.NewBot(token)
 	require.NoError(t, err)
